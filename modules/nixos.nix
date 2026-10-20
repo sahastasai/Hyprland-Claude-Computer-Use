@@ -30,12 +30,27 @@ in
       description = "Also install Anthropic's official Linux Claude Desktop (FHS build).";
     };
 
+    tiers = lib.mkOption {
+      type = lib.types.enum [
+        "full"
+        "strict"
+      ];
+      default = "full";
+      description = ''
+        "full" lets Claude click and type in every app you approve, browsers and
+        terminals included; Claude Desktop's own window stays read-only.
+        "strict" uses the macOS tiers: browsers read-only, terminals and IDEs
+        click-only.
+      '';
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.callPackage ../pkgs/computer-use-hyprland {
         hyprland = config.programs.hyprland.package;
+        inherit (cfg) tiers;
       };
-      defaultText = lib.literalExpression "computer-use-hyprland built against programs.hyprland.package";
+      defaultText = lib.literalExpression "computer-use-hyprland built against programs.hyprland.package with cfg.tiers";
       description = "The computer-use-hyprland package.";
     };
   };

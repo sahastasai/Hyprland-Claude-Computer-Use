@@ -23,8 +23,10 @@ They behave like the built-in server:
 
 - **Per-app approval.** `request_access` opens a desktop dialog listing each
   app. Clipboard access and Super-key shortcuts are separate checkboxes.
-- **Tiers.** Browsers are `read` (visible only), terminals and IDEs are
-  `click` (left-click and scroll only), and everything else is `full`.
+- **Full control.** Every app you approve can be clicked, typed into and
+  driven with key combos, browsers and terminals included. Set
+  `tiers = "strict"` for the macOS tiers instead: browsers `read` (visible
+  only), terminals and IDEs `click` (left-click and scroll only).
 - **Redaction.** Windows of apps you haven't approved are blacked out in
   screenshots, and input aimed at them is refused.
 - **Guidance.** The server sends the built-in server's usage rules (tool
@@ -96,6 +98,7 @@ NixOS (`programs.claude-computer-use`):
 | `enable` | `false` | Install the server and enable `ydotoold`. |
 | `users` | `[ ]` | Users added to the `ydotool` group. |
 | `installClaudeDesktop` | `true` | Also install Claude Desktop (FHS build). |
+| `tiers` | `"full"` | `"full"`: control every approved app. `"strict"`: macOS tiers. |
 | `package` | built against `programs.hyprland.package` | Server package. |
 
 Home Manager (`programs.claude-computer-use`):
@@ -116,7 +119,9 @@ nix run github:sahastasai/Hyprland-Claude-Computer-Use   # MCP server on stdio
 claude mcp add -s user computer-use-hyprland -- "$(nix build --print-out-paths github:sahastasai/Hyprland-Claude-Computer-Use)/bin/claude-computer-use"
 ```
 
-Input still needs a running `ydotoold` that your user can reach.
+Input still needs a running `ydotoold` that your user can reach. Set
+`CLAUDE_COMPUTER_USE_TIERS=strict` in the server's environment for the macOS
+tiers.
 
 ## Notes
 
@@ -136,7 +141,8 @@ Tested on Hyprland 0.55 with NixOS 26.05:
 - `open_application` jumping across workspaces;
 - Unicode typing;
 - key combos, clicks, triple-click, drag-select and scroll direction;
-- redaction and tier enforcement.
+- typing and key combos in a terminal at the default full tier;
+- redaction, and the read-only Claude Desktop window.
 
 Not yet tested: setups with more than one monitor, and use from inside Claude
 Desktop itself.

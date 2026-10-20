@@ -10,6 +10,8 @@
   libnotify,
   gtk3,
   hyprland,
+  # "full": every approved app is controllable; "strict": macOS-style tiers.
+  tiers ? "full",
 }:
 
 # Hyprland computer-use MCP server shared by Claude Code and Claude Desktop.
@@ -29,6 +31,7 @@ writeShellApplication {
     hyprland
   ];
   text = ''
+    export CLAUDE_COMPUTER_USE_TIERS=${tiers}
     export CLAUDE_CU_GTK_LAUNCH=${lib.getExe' gtk3 "gtk-launch"}
     exec ${lib.getExe python} -I ${./server.py} "$@"
   '';
