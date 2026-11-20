@@ -56,7 +56,7 @@ class Base(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.calls = []
         self.active = FIREFOX
-        env = {"CLAUDE_CU_STATE_DIR": self.tmp.name, **self.env}
+        env = {"CLAUDE_CU_STATE_DIR": self.tmp.name, "CLAUDE_CU_INPUT": "ydotool", **self.env}
         for k in ("CLAUDE_CU_AUTO_GRANT", "CLAUDE_CU_ALLOW", "CLAUDE_CU_DENY", "CLAUDE_CU_AUDIT"):
             env.setdefault(k, "")
         patches = [
@@ -240,6 +240,35 @@ class AllowList(Base):
         res = json.loads(self.cu.call("request_access", {"apps": ["firefox", "kitty"]})[0]["text"])
         self.assertEqual(len(self.tools_run("zenity")), 1)
         self.assertEqual(res["granted"], [{"app": "kitty", "tier": "full"}])
+
+
+class WaylandInput(Base):
+    env = {"CLAUDE_CU_AUTO_GRANT": "1", "CLAUDE_CU_INPUT": "wayland"}
+
+    def test_clicks_keys_scroll_without_ydotool(self):
+        self.cu.call("double_click", {"coordinate": [100, 100]})
+        self.assertEqual(self.tools_run("wlrctl"), [["wlrctl", "pointer", "click", "left"]] * 2)
+        self.cu.call("key", {"text": "ctrl+shift+t Return"})
+        self.cu.call("scroll", {"coordinate": [100, 100], "scroll_direction": "down", "scroll_amount": 1})
+        self.cu.call("hold_key", {"text": "ctrl+a", "duration": 0.5})
+        self.assertEqual(self.tools_run("ydotool"), [])
+        self.assertEqual(self.tools_run("wtype"), [
+            ["wtype", "-M", "ctrl", "-M", "shift", "-k", "t", "-m", "shift", "-m", "ctrl"],
+            ["wtype", "-k", "Return"],
+            ["wtype", "-M", "ctrl", "-P", "a", "-s", "500", "-p", "a", "-m", "ctrl"],
+        ])
+        self.assertEqual(self.tools_run("wlrctl")[-1], ["wlrctl", "pointer", "scroll", "15", "0"])
+
+    def test_unsupported_actions_explain(self):
+        with self.assertRaisesRegex(srv.ToolError, "needs ydotoold"):
+            self.cu.call("left_click_drag", {"start_coordinate": [10, 10], "coordinate": [100, 100]})
+        with self.assertRaisesRegex(srv.ToolError, "needs ydotoold"):
+            self.cu.call("left_click", {"coordinate": [100, 100], "text": "shift"})
+
+    def test_keysym_mapping(self):
+        self.assertEqual(srv.wtype_args(srv.parse_combo("F5")), ["wtype", "-k", "F5"])
+        self.assertEqual(srv.wtype_args(srv.parse_combo("A")), ["wtype", "-M", "shift", "-k", "a", "-m", "shift"])
+        self.assertEqual(srv.wtype_args(srv.parse_combo("page_down")), ["wtype", "-k", "Next"])
 
 
 class SecretHeuristic(unittest.TestCase):

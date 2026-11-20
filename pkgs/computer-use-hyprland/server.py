@@ -6,7 +6,8 @@ open_application, switch_display, computer_batch, ...) on top of Hyprland:
 
   screenshots   grim (per monitor), Pillow for scaling/redaction
   pointer       hyprctl movecursor (absolute, layout coordinates) + ydotool buttons/wheel
-  keyboard      ydotool keycodes for combos, wtype for text
+                (wlrctl virtual pointer when ydotoold isn't reachable)
+  keyboard      ydotool keycodes for combos (wtype when ydotoold isn't reachable), wtype for text
   windows       hyprctl clients/monitors/activewindow, focuswindow across workspaces
   approval      zenity checklist dialog
   clipboard     wl-clipboard
@@ -494,6 +495,57 @@ SHIFTED = {
 MODIFIERS = {29, 42, 54, 56, 97, 100, 125, 126}
 SUPER_CODES = {125, 126}
 
+# Wayland virtual-keyboard backend (wtype): input codes -> xkb names.
+WTYPE_MODS = {29: "ctrl", 97: "ctrl", 42: "shift", 54: "shift", 56: "alt", 100: "altgr", 125: "logo", 126: "logo"}
+KEYSYMS = {
+    1: "Escape", 14: "BackSpace", 15: "Tab", 28: "Return", 96: "KP_Enter", 57: "space", 12: "minus",
+    13: "equal", 26: "bracketleft", 27: "bracketright", 39: "semicolon", 40: "apostrophe", 41: "grave",
+    43: "backslash", 51: "comma", 52: "period", 53: "slash", 55: "KP_Multiply", 58: "Caps_Lock",
+    69: "Num_Lock", 70: "Scroll_Lock", 99: "Print", 102: "Home", 103: "Up", 104: "Prior", 105: "Left",
+    106: "Right", 107: "End", 108: "Down", 109: "Next", 110: "Insert", 111: "Delete",
+    113: "XF86AudioMute", 114: "XF86AudioLowerVolume", 115: "XF86AudioRaiseVolume", 119: "Pause",
+    127: "Menu", 163: "XF86AudioNext", 164: "XF86AudioPlay", 165: "XF86AudioPrev",
+}
+for _name, _code in KEYCODES.items():
+    if len(_name) == 1 and _name.isalnum():
+        KEYSYMS.setdefault(_code, _name)
+    elif re.fullmatch(r"f\d+", _name):
+        KEYSYMS[_code] = _name.upper()
+
+
+def wtype_args(codes, hold_ms=None):
+    """wtype invocation pressing `codes` together (and holding them hold_ms)."""
+    mods = list(dict.fromkeys(WTYPE_MODS[c] for c in codes if c in WTYPE_MODS))
+    try:
+        keys = [KEYSYMS[c] for c in codes if c not in WTYPE_MODS]
+    except KeyError as e:
+        raise ToolError(f"Key code {e} has no Wayland keysym mapping.") from None
+    args = ["wtype"]
+    for m in mods:
+        args += ["-M", m]
+    if hold_ms is None:
+        for k in keys:
+            args += ["-k", k]
+    else:
+        for k in keys:
+            args += ["-P", k]
+        args += ["-s", str(int(hold_ms))]
+        for k in reversed(keys):
+            args += ["-p", k]
+    for m in reversed(mods):
+        args += ["-m", m]
+    return args
+
+
+def input_backend():
+    """"ydotool" (uinput via ydotoold) or "wayland" (virtual keyboard/pointer
+    protocols via wtype/wlrctl; no uinput or group membership needed)."""
+    mode = os.environ.get("CLAUDE_CU_INPUT", "auto")
+    if mode in ("ydotool", "wayland"):
+        return mode
+    sock = os.environ.get("YDOTOOL_SOCKET", "/run/ydotoold/socket")
+    return "ydotool" if os.path.exists(sock) and os.access(sock, os.W_OK) else "wayland"
+
 
 def parse_combo(combo):
     codes = []
@@ -737,7 +789,37 @@ class ComputerUse:
     def move(self, gx, gy):
         dispatch("movecursor", str(gx), str(gy))
 
+    def wayland_only(self, what):
+        if input_backend() == "wayland":
+            raise ToolError(
+                f"{what} needs ydotoold (uinput), which isn't reachable; the Wayland "
+                "virtual-pointer fallback only supports clicks, scrolling and keys."
+            )
+
+    def button(self, button, count):
+        if input_backend() == "wayland":
+            for i in range(count):
+                run(["wlrctl", "pointer", "click", button])
+                if i + 1 < count:
+                    time.sleep(0.06)
+            return
+        code = {"left": 0x00, "right": 0x01, "middle": 0x02}[button]
+        for i in range(count):
+            self.ydotool("click", hex(0xC0 | code))
+            if i + 1 < count:
+                time.sleep(0.06)
+
+    def wheel(self, dx, dy):
+        """One wheel tick; dy=1 is up, dx=1 is right."""
+        if input_backend() == "wayland":
+            run(["wlrctl", "pointer", "scroll", str(-15 * dy), str(15 * dx)])
+        else:
+            self.ydotool("mousemove", "--wheel", "-x", str(dx), "-y", str(dy))
+
     def press_codes(self, codes):
+        if input_backend() == "wayland":
+            run(wtype_args(codes))
+            return
         self.ydotool("key", *[f"{c}:1" for c in codes], *[f"{c}:0" for c in reversed(codes)])
 
     def modifier_codes(self, text):
@@ -773,16 +855,14 @@ class ComputerUse:
             target = self.active_window()
         self.check_target(action, target, modifiers=bool(mods))
         self.check_system_combo(mods)
+        if mods:
+            self.wayland_only("Modifier-clicks")
         self.move(gx, gy)
         time.sleep(0.03)
-        code = {"left": 0x00, "right": 0x01, "middle": 0x02}[button]
         if mods:
             self.ydotool("key", *[f"{c}:1" for c in mods])
         try:
-            for i in range(count):
-                self.ydotool("click", hex(0xC0 | code))
-                if i + 1 < count:
-                    time.sleep(0.06)
+            self.button(button, count)
         finally:
             if mods:
                 self.ydotool("key", *[f"{c}:0" for c in reversed(mods)])
@@ -953,6 +1033,7 @@ class ComputerUse:
         end_win = self.window_at(mon, ex, ey, all_c)
         if end_win is not None:
             self.check_target("left_click_drag", end_win)
+        self.wayland_only("Dragging")
         self.move(sx, sy)
         time.sleep(0.05)
         self.ydotool("click", "0x40")
@@ -971,11 +1052,14 @@ class ComputerUse:
         mon = self.current_monitor()
         pos = hyprctl_json("cursorpos")
         self.check_target("left_mouse_down", self.window_at(mon, pos["x"], pos["y"]) or self.active_window())
+        self.wayland_only("left_mouse_down")
         self.ydotool("click", "0x40")
         self.mouse_down = True
         return [text_content("Left mouse button pressed")]
 
     def t_left_mouse_up(self, args):
+        if input_backend() == "wayland":
+            return [text_content("Left mouse button is not held (Wayland input backend)")]
         self.ydotool("click", "0x80")
         self.mouse_down = False
         return [text_content("Left mouse button released")]
@@ -995,6 +1079,8 @@ class ComputerUse:
             gx, gy = pos["x"], pos["y"]
         mods = self.modifier_codes(args.get("text"))
         self.check_target("scroll", self.window_at(mon, gx, gy) or self.active_window(), modifiers=bool(mods))
+        if mods:
+            self.wayland_only("Modifier-scrolling")
         self.move(gx, gy)
         time.sleep(0.03)
         dx = {"left": -1, "right": 1}.get(direction, 0)
@@ -1003,7 +1089,7 @@ class ComputerUse:
             self.ydotool("key", *[f"{c}:1" for c in mods])
         try:
             for _ in range(amount):
-                self.ydotool("mousemove", "--wheel", "-x", str(dx), "-y", str(dy))
+                self.wheel(dx, dy)
                 time.sleep(0.02)
         finally:
             if mods:
@@ -1022,6 +1108,8 @@ class ComputerUse:
         try:
             run(["wtype", "-d", "4", "--", text], timeout=max(30, len(text) // 20))
         except (ToolError, FileNotFoundError):
+            if input_backend() == "wayland":
+                raise
             self.ydotool("type", "--key-delay", "6", "--", text)
         self.notify()
         return [text_content(f"Typed {len(text)} characters into {g['name']}")]
@@ -1049,6 +1137,9 @@ class ComputerUse:
             raise ToolError("duration must be between 0 and 100 seconds.")
         self.check_system_combo(codes)
         self.keyboard_target("hold_key")
+        if input_backend() == "wayland":
+            run(wtype_args(codes, hold_ms=duration * 1000), timeout=duration + 30)
+            return [text_content(f"Held {args.get('text')} for {duration}s")]
         self.ydotool("key", *[f"{c}:1" for c in codes])
         try:
             time.sleep(duration)

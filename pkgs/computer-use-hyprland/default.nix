@@ -6,6 +6,7 @@
   grim,
   ydotool,
   wtype,
+  wlrctl,
   wl-clipboard,
   zenity,
   libnotify,
@@ -38,6 +39,7 @@ let
       grim
       ydotool
       wtype
+      wlrctl
       wl-clipboard
       zenity
       libnotify
