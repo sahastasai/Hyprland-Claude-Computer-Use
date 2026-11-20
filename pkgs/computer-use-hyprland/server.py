@@ -11,12 +11,18 @@ open_application, switch_display, computer_batch, ...) on top of Hyprland:
   approval      zenity checklist dialog
   clipboard     wl-clipboard
 
+Auto-grant mode (CLAUDE_CU_AUTO_GRANT=1) is for machines dedicated to an agent:
+every app is granted without a dialog (Claude Desktop stays read-only), every
+call is checked against a revocation file and written to a JSONL audit log.
+`claude-cu revoke` / `claude-cu restore` flip the revocation file.
+
 Speaks MCP over newline-delimited JSON-RPC on stdio with no dependencies
 beyond Pillow.
 """
 
 import base64
 import configparser
+import datetime
 import glob
 import io
 import json
@@ -31,7 +37,7 @@ from PIL import Image, ImageDraw
 
 # Claude Code reserves "computer-use" for its built-in macOS server.
 SERVER_NAME = "computer-use-hyprland"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 MAX_LONG_EDGE = 1568
 MAX_PIXELS = 1_150_000
 JPEG_QUALITY = 80
@@ -287,6 +293,112 @@ def resolve_app(name, entries, clients):
 
 
 # --------------------------------------------------------------------------
+# Auto-grant, revocation and audit log
+# --------------------------------------------------------------------------
+
+
+def env_flag(name):
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def env_list(name):
+    return {norm(x) for x in re.split(r"[,\n]", os.environ.get(name, "")) if norm(x)}
+
+
+def state_dir():
+    """Fixed per-user location (not XDG_STATE_HOME) so the server and a shell
+    running `claude-cu revoke` always agree on the revocation file."""
+    return os.environ.get("CLAUDE_CU_STATE_DIR") or os.path.expanduser("~/.local/state/claude-computer-use")
+
+
+def revoke_file():
+    return os.path.join(state_dir(), "revoked")
+
+
+def audit_log_path():
+    return os.path.join(state_dir(), "audit.jsonl")
+
+
+def check_not_revoked():
+    path = revoke_file()
+    if os.path.lexists(path):
+        reason = ""
+        try:
+            with open(path) as f:
+                reason = f.read(300).strip()
+        except OSError:
+            pass
+        raise ToolError(
+            "Computer use has been REVOKED by the owner"
+            + (f" ({reason})" if reason else "")
+            + f". Every computer-use action is disabled while {path} exists. Stop "
+            "using computer-use tools and tell the user. Only the owner restores "
+            "access (claude-cu restore); do not do it yourself unless they ask."
+        )
+
+
+SECRET_RE = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY|\b(?:sk|pk|rk)[-_][A-Za-z0-9_-]{8,}|\bgh[pousr]_[A-Za-z0-9]{16,}"
+    r"|\bgithub_pat_|\bAKIA[0-9A-Z]{12,}|\bxox[abprs]-|\bAIza[0-9A-Za-z_-]{16,}|\beyJ[A-Za-z0-9_-]{8,}\."
+    r"|passw|passphrase|secret|token|api[_-]?key|bearer\s|authorization|private[_ -]?key|\botp\b|\bpin\b",
+    re.I,
+)
+
+
+def looks_secret(text):
+    """Conservative: anything that might be a credential is redacted."""
+    if SECRET_RE.search(text):
+        return True
+    for word in text.split():
+        has_alpha = re.search(r"[A-Za-z]", word)
+        has_digit = re.search(r"[0-9]", word)
+        if len(word) >= 20 and has_alpha and has_digit:
+            return True
+        if (len(word) >= 10 and has_digit and re.search(r"[a-z]", word) and re.search(r"[A-Z]", word)) or (
+            len(word) >= 8 and has_alpha and has_digit and re.search(r"[^A-Za-z0-9]", word)
+        ):
+            return True
+    return False
+
+
+def safe_text(text):
+    if not isinstance(text, str):
+        return None
+    if looks_secret(text):
+        return f"[redacted: {len(text)} chars]"
+    return text if len(text) <= 200 else text[:200] + f"... [{len(text)} chars]"
+
+
+AUDIT_ARGS = ("coordinate", "start_coordinate", "region", "scroll_direction", "scroll_amount",
+              "display", "app", "apps", "duration", "repeat", "clipboardRead", "clipboardWrite",
+              "systemKeyCombos", "save_to_disk")
+
+
+def audit_args(name, args):
+    out = {k: args[k] for k in AUDIT_ARGS if k in args}
+    if "text" in args:  # typed text, clipboard text, key combos, modifiers
+        out["text"] = safe_text(args["text"])
+    if name == "computer_batch" and isinstance(args.get("actions"), list):
+        out["actions"] = len(args["actions"])
+    return out
+
+
+def audit(record):
+    path = audit_log_path()
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except OSError as e:
+        print(f"computer-use-hyprland: audit log {path}: {e}", file=sys.stderr)
+
+
+def now_iso():
+    return datetime.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+# --------------------------------------------------------------------------
 # Displays and windows (Hyprland monitors, workspaces, clients)
 # --------------------------------------------------------------------------
 
@@ -420,6 +532,17 @@ class ComputerUse:
         self.geometry = {}  # monitor name -> (img_w, img_h) of last screenshot
         self.mouse_down = False
         self.notified = False
+        self.last_app = None  # for the audit log
+        # Auto-grant: no approval dialog, every app controllable (Claude's own
+        # windows stay read-only). Optional allow list limits which apps are
+        # auto-granted (others still get the dialog); the deny list is never
+        # granted.
+        self.auto = env_flag("CLAUDE_CU_AUTO_GRANT")
+        self.allow = env_list("CLAUDE_CU_ALLOW") if self.auto else set()
+        self.deny = env_list("CLAUDE_CU_DENY") if self.auto else set()
+        self.audit_enabled = self.auto or env_flag("CLAUDE_CU_AUDIT")
+        if self.auto:
+            self.flags = {k: True for k in self.flags}
 
     # ---------------- grants ----------------
 
@@ -430,7 +553,30 @@ class ComputerUse:
                 return g
         return None
 
+    def is_denied(self, keys):
+        return bool(self.deny and keys & self.deny)
+
+    def auto_allowed(self, keys):
+        return self.auto and not self.is_denied(keys) and (not self.allow or bool(keys & self.allow))
+
+    @staticmethod
+    def record_keys(r):
+        return set(r["classes"]) | {k for k in (norm(r["name"]), norm(r.get("desktop_id"))) if k}
+
+    def grant_for_window(self, c):
+        """Grant covering a Hyprland client, auto-granting it when enabled."""
+        keys = {k for k in (norm(c.get("class")), norm(c.get("initialClass"))) if k}
+        if self.is_denied(keys):
+            return None
+        g = self.grant_for_class(c.get("class", "")) or self.grant_for_class(c.get("initialClass", ""))
+        if g is None and self.auto_allowed(keys):
+            g = {"name": c.get("class") or c.get("initialClass") or "(unnamed window)",
+                 "desktop_id": None, "classes": keys, "tier": tier_for(keys), "auto": True}
+        return g
+
     def require_any_grant(self):
+        if self.auto:
+            return
         if not self.grants:
             raise ToolError(
                 "No applications are granted yet. Call request_access with the "
@@ -444,7 +590,11 @@ class ComputerUse:
                 "No application window is at that location or focused. Use "
                 "open_application to bring a granted app forward first."
             )
-        g = self.grant_for_class(window["class"]) or self.grant_for_class(window.get("initialClass", ""))
+        g = self.grant_for_window(window)
+        if g is not None:
+            self.last_app = g["name"]
+        if g is None and self.is_denied({norm(window.get("class")), norm(window.get("initialClass"))}):
+            raise ToolError(f"'{window_label(window)}' is on the auto-grant deny list (CLAUDE_CU_DENY).")
         if g is None:
             raise ToolError(
                 f"'{window_label(window)}' (class {window['class']}) is not granted. "
@@ -534,7 +684,7 @@ class ComputerUse:
             box = (max(0, x0), max(0, y0), min(img.width, x1), min(img.height, y1))
             if box[2] <= box[0] or box[3] <= box[1]:
                 continue
-            if self.grant_for_class(c["class"]) or self.grant_for_class(c.get("initialClass", "")):
+            if self.grant_for_window(c):
                 img.paste(original.crop(box), box[:2])
             else:
                 draw.rectangle(box, fill=(32, 32, 36))
@@ -558,7 +708,7 @@ class ComputerUse:
         ids, _ = visible_workspaces(mon)
         elsewhere = []
         for c in clients():
-            g = self.grant_for_class(c["class"])
+            g = self.grant_for_window(c)
             if g and c["workspace"]["id"] not in ids and not (c.get("pinned") and c["monitor"] == mon["id"]):
                 elsewhere.append(f"{g['name']} (workspace {c['workspace']['name']})")
         if elsewhere:
@@ -670,6 +820,15 @@ class ComputerUse:
                 ("systemKeyCombos", "Super-key / Hyprland system shortcuts"),
             ) if args.get(k) and not self.flags[k]
         ]
+        refused = []
+        if self.auto:
+            for r in resolved:
+                keys = self.record_keys(r)
+                if self.is_denied(keys):
+                    refused.append(r)
+                elif self.auto_allowed(keys) and r["name"] not in self.grants:
+                    self.grants[r["name"]] = r
+            resolved = [r for r in resolved if r not in refused]
         pending = [r for r in resolved if r["name"] not in self.grants]
         approved, approved_flags = set(), set()
         if pending or flag_rows:
@@ -706,8 +865,12 @@ class ComputerUse:
             for r in resolved if r["name"] in self.grants
         ]
         denied = [{"app": r["name"], "reason": "user denied"} for r in resolved if r["name"] not in self.grants]
+        denied += [{"app": r["name"], "reason": "on the auto-grant deny list"} for r in refused]
         denied += [{"app": a, "reason": "not found: no desktop entry or open window matches this name"} for a in unknown]
+        self.last_app = ", ".join(g["app"] for g in granted) or None
         result = {"granted": granted, "denied": denied, **{k: v for k, v in self.flags.items()}}
+        if self.auto:
+            result["autoGrant"] = True
         if unknown:
             running = sorted({c["class"] for c in cl if c["class"]})
             result["hint"] = "Running window classes: " + ", ".join(running)
@@ -722,11 +885,15 @@ class ComputerUse:
                 for c in cl if norm(c["class"]) in g["classes"]
             ]
             out.append({"app": g["name"], "tier": g["tier"], "windows": wins})
-        return [text_content(json.dumps({"granted": out, **self.flags}, indent=2))]
+        result = {"granted": out, **self.flags}
+        if self.auto:
+            result["autoGrant"] = "on: every app not on the deny list is controllable without request_access (Claude Desktop read-only)"
+        return [text_content(json.dumps(result, indent=2))]
 
     def t_screenshot(self, args):
         self.require_any_grant()
         mon = self.current_monitor()
+        self.last_app = f"display:{mon['name']}"
         img = self.capture(mon)
         out, b64 = self.screenshot_content(mon, img)
         content = [image_content(b64)]
@@ -913,8 +1080,13 @@ class ComputerUse:
                 if norm(name) in (norm(cand["name"]), norm(cand.get("desktop_id"))) or norm(name) in cand["classes"]:
                     g = cand
                     break
+        if g is None and self.auto:
+            r = resolve_app(name, desktop_entries(), clients())
+            if r is not None and self.auto_allowed(self.record_keys(r)):
+                self.grants[r["name"]] = g = r
         if g is None:
             raise ToolError(f"'{name}' is not granted. Call request_access with it first.")
+        self.last_app = g["name"]
         win = self.find_window(g)
         launched = False
         if win is None:
@@ -995,7 +1167,7 @@ class ComputerUse:
             if name in ("computer_batch", "request_access") or name not in BATCHABLE:
                 raise ToolError(f"actions[{i}]: '{name}' cannot be used inside computer_batch.")
             try:
-                res = getattr(self, "t_" + name)({k: v for k, v in item.items() if k != "action"})
+                res = self.call(name, {k: v for k, v in item.items() if k != "action"}, batch_index=i)
             except ToolError as e:
                 content.append(text_content(f"[{i}] {name}: ERROR {e}. Stopped; remaining actions were not run."))
                 return content, True
@@ -1004,6 +1176,31 @@ class ComputerUse:
                     c = text_content(f"[{i}] {name}: {c['text']}")
                 content.append(c)
         return content
+
+    def call(self, name, args, batch_index=None):
+        """Run one tool: revocation check on every call, then audit."""
+        fn = getattr(self, "t_" + str(name), None)
+        if fn is None:
+            raise ToolError(f"Unknown tool {name}")
+        self.last_app = None
+        ok, error = False, None
+        try:
+            check_not_revoked()
+            res = fn(args)
+            ok = not (isinstance(res, tuple) and res[1])
+            return res
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}" if not isinstance(e, ToolError) else str(e)
+            raise
+        finally:
+            if self.audit_enabled:
+                rec = {"ts": now_iso(), "tool": name, "app": self.last_app,
+                       "args": audit_args(name, args), "ok": ok, "pid": os.getpid()}
+                if batch_index is not None:
+                    rec["batch_index"] = batch_index
+                if error:
+                    rec["error"] = error[:300]
+                audit(rec)
 
 
 GTK_LAUNCH = os.environ.get("CLAUDE_CU_GTK_LAUNCH", "gtk-launch")
@@ -1161,6 +1358,68 @@ The tier is enforced on the window under the pointer (clicks) or the focused win
 
 INSTRUCTIONS = INSTRUCTIONS.replace("{tiers}", STRICT_TIERS if TIER_POLICY == "strict" else FULL_TIERS)
 
+ACCESS_FLOW = INSTRUCTIONS[INSTRUCTIONS.index("**Access flow:**"):INSTRUCTIONS.index("\n\n**Hyprland specifics:**")]
+AUTO_ACCESS_FLOW = """**Access flow (auto-grant is ON):** this computer is dedicated to the agent and its owner turned off approval prompts. `request_access` grants apps immediately with no dialog, and every app's windows are visible and controllable even without it; clipboard and Super-key combos are allowed. Claude's own windows (Claude Desktop) stay read-only. Calling `request_access` first is still good practice. Every action is written to an audit log.
+
+**Revocation:** the owner can revoke access at any time (in chat, on WhatsApp, or with `claude-cu revoke`). When the owner asks you to revoke access, run `claude-cu revoke` right away. If a tool reports that access is revoked, stop using computer-use tools and tell the user. Never run `claude-cu restore` or delete the revocation file unless the owner explicitly tells you to."""
+
+
+def instructions(auto):
+    return INSTRUCTIONS.replace(ACCESS_FLOW, AUTO_ACCESS_FLOW) if auto else INSTRUCTIONS
+
+
+# --------------------------------------------------------------------------
+# claude-cu command line: revoke / restore / status / log
+# --------------------------------------------------------------------------
+
+CLI_USAGE = """usage: claude-cu <command>
+
+  revoke [reason]   disable every computer-use action (takes effect on the next call)
+  restore           re-enable computer use
+  status            show whether computer use is revoked
+  log [N]           print the last N audit-log entries (default 20)
+
+State: {dir}"""
+
+
+def cli(argv):
+    cmd = argv[0] if argv else ""
+    path = revoke_file()
+    if cmd == "revoke":
+        reason = " ".join(argv[1:]).strip()
+        os.makedirs(state_dir(), mode=0o700, exist_ok=True)
+        with open(path, "w") as f:
+            f.write(f"revoked {now_iso()}" + (f": {reason}" if reason else "") + "\n")
+        audit({"ts": now_iso(), "event": "revoke", "reason": reason or None, "pid": os.getpid()})
+        print(f"Computer use revoked: {path} created. Every action now fails until `claude-cu restore`.")
+        return 0
+    if cmd == "restore":
+        existed = os.path.lexists(path)
+        if existed:
+            os.remove(path)
+        audit({"ts": now_iso(), "event": "restore", "was_revoked": existed, "pid": os.getpid()})
+        print("Computer use restored." if existed else "Computer use was not revoked.")
+        return 0
+    if cmd == "status":
+        if os.path.lexists(path):
+            with open(path) as f:
+                print(f"REVOKED ({f.read(300).strip()}): {path}")
+        else:
+            print(f"active (no {path})")
+        print(f"audit log: {audit_log_path()}")
+        return 0
+    if cmd == "log":
+        n = int(argv[1]) if len(argv) > 1 else 20
+        try:
+            with open(audit_log_path()) as f:
+                lines = f.readlines()[-n:]
+        except FileNotFoundError:
+            lines = []
+        sys.stdout.writelines(lines)
+        return 0
+    print(CLI_USAGE.format(dir=state_dir()), file=sys.stderr)
+    return 0 if cmd in ("-h", "--help", "help") else 2
+
 
 # --------------------------------------------------------------------------
 # MCP stdio loop
@@ -1168,6 +1427,8 @@ INSTRUCTIONS = INSTRUCTIONS.replace("{tiers}", STRICT_TIERS if TIER_POLICY == "s
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "cli":
+        sys.exit(cli(sys.argv[2:]))
     cu = ComputerUse()
     out = sys.stdout
 
@@ -1191,7 +1452,7 @@ def main():
                 "protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
                 "capabilities": {"tools": {"listChanged": False}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-                "instructions": INSTRUCTIONS,
+                "instructions": instructions(cu.auto),
             }})
         elif method == "ping":
             send({"jsonrpc": "2.0", "id": mid, "result": {}})
@@ -1208,7 +1469,7 @@ def main():
                 send({"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"Unknown tool {name}"}})
                 continue
             try:
-                res = fn(args)
+                res = cu.call(name, args)
                 is_error = False
                 if isinstance(res, tuple):
                     res, is_error = res

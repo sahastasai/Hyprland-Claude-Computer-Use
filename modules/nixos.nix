@@ -44,13 +44,47 @@ in
       '';
     };
 
+    autoGrant = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Skip the approval dialog: request_access and every action succeed for
+        every app (Claude Desktop's own window stays read-only). Meant for a
+        machine dedicated to an agent. Every call is written to
+        ~/.local/state/claude-computer-use/audit.jsonl, and `claude-cu revoke`
+        disables all actions until `claude-cu restore`.
+      '';
+    };
+
+    autoGrantAllow = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [
+        "firefox"
+        "kitty"
+      ];
+      description = "With autoGrant, auto-grant only these apps (names, desktop ids or window classes); others still get the dialog. Empty means all.";
+    };
+
+    autoGrantDeny = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "org.keepassxc.KeePassXC" ];
+      description = "With autoGrant, never grant these apps.";
+    };
+
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.callPackage ../pkgs/computer-use-hyprland {
         hyprland = config.programs.hyprland.package;
-        inherit (cfg) tiers;
+        inherit (cfg)
+          tiers
+          autoGrant
+          autoGrantAllow
+          autoGrantDeny
+          ;
       };
-      defaultText = lib.literalExpression "computer-use-hyprland built against programs.hyprland.package with cfg.tiers";
+      defaultText = lib.literalExpression "computer-use-hyprland built against programs.hyprland.package with cfg.tiers and cfg.autoGrant*";
       description = "The computer-use-hyprland package.";
     };
   };
@@ -59,8 +93,9 @@ in
     environment.systemPackages = [
       cfg.package
     ]
-    ++ lib.optional cfg.installClaudeDesktop
-      claude-desktop.packages.${pkgs.stdenv.hostPlatform.system}.default;
+    ++
+      lib.optional cfg.installClaudeDesktop
+        claude-desktop.packages.${pkgs.stdenv.hostPlatform.system}.default;
 
     # Pointer buttons, wheel and key combos go through a uinput virtual device
     # owned by ydotoold; group membership grants access to its socket.

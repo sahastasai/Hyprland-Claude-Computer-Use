@@ -32,6 +32,44 @@ They behave like the built-in server:
 - **Guidance.** The server sends the built-in server's usage rules (tool
   choice, access flow, link safety, no money movement) as MCP instructions.
 
+## Auto-grant mode (dedicated agent machines)
+
+On a computer that exists only to run an agent, the approval dialog is just
+in the way. Turn on auto-grant with `programs.claude-computer-use.autoGrant =
+true` or `CLAUDE_CU_AUTO_GRANT=1` in the server's environment:
+
+- `request_access` grants every app at once, with no dialog, and every action
+  works on every app even without it. Clipboard and Super-key combos are
+  allowed.
+- Claude Desktop's own window stays `read`, so on-screen text can't drive the
+  agent through it.
+- `autoGrantAllow` / `CLAUDE_CU_ALLOW` (comma-separated names, desktop ids or
+  window classes) limits auto-grant to those apps; others get the dialog.
+  `autoGrantDeny` / `CLAUDE_CU_DENY` apps are never granted or shown.
+- **Revocation.** While `~/.local/state/claude-computer-use/revoked` exists,
+  every tool call fails with a clear "revoked" message. The file is checked on
+  every call, including each action of a `computer_batch`. `claude-cu revoke
+  [reason]` creates it and `claude-cu restore` removes it. The revocation file
+  works in prompting mode too.
+- **Audit log.** Every call is appended to
+  `~/.local/state/claude-computer-use/audit.jsonl` (mode 0600): timestamp,
+  tool, app, arguments and result. Typed or clipboard text that looks like a
+  credential is replaced by `[redacted: N chars]`. `claude-cu log 50` shows the
+  tail. Set `CLAUDE_CU_AUDIT=1` to log in prompting mode too.
+  `CLAUDE_CU_STATE_DIR` moves the state directory.
+
+Without the NixOS module:
+
+```sh
+pkg=$(nix build --no-link --print-out-paths github:sahastasai/Hyprland-Claude-Computer-Use)
+claude mcp add --scope user computer-use-hyprland \
+  -e CLAUDE_CU_AUTO_GRANT=1 -e WAYLAND_DISPLAY=wayland-1 -e XDG_RUNTIME_DIR=/run/user/$(id -u) \
+  -- "$pkg/bin/claude-computer-use"
+"$pkg/bin/claude-cu" status
+```
+
+Prompting is unchanged when auto-grant is off, which is the default.
+
 ## Hyprland support
 
 - **Workspaces.** Screenshots show the focused monitor's active workspace plus
@@ -99,6 +137,9 @@ NixOS (`programs.claude-computer-use`):
 | `users` | `[ ]` | Users added to the `ydotool` group. |
 | `installClaudeDesktop` | `true` | Also install Claude Desktop (FHS build). |
 | `tiers` | `"full"` | `"full"`: control every approved app. `"strict"`: macOS tiers. |
+| `autoGrant` | `false` | Grant every app without a dialog (see above). |
+| `autoGrantAllow` | `[ ]` | Auto-grant only these apps; empty means all. |
+| `autoGrantDeny` | `[ ]` | Never grant these apps. |
 | `package` | built against `programs.hyprland.package` | Server package. |
 
 Home Manager (`programs.claude-computer-use`):

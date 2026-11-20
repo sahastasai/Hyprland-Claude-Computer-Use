@@ -46,6 +46,17 @@
 
       checks = forAllSystems (pkgs: {
         computer-use-hyprland = self.packages.${pkgs.stdenv.hostPlatform.system}.computer-use-hyprland;
+        server-tests =
+          pkgs.runCommand "computer-use-hyprland-tests"
+            {
+              nativeBuildInputs = [
+                self.packages.${pkgs.stdenv.hostPlatform.system}.computer-use-hyprland.passthru.python
+              ];
+            }
+            ''
+              HOME=$TMPDIR python3 -W error::ResourceWarning ${./.}/tests/test_server.py
+              touch $out
+            '';
         nixos-module =
           (nixpkgs.lib.nixosSystem {
             inherit (pkgs.stdenv.hostPlatform) system;
@@ -56,6 +67,8 @@
                 programs.claude-computer-use = {
                   enable = true;
                   users = [ "alice" ];
+                  autoGrant = true;
+                  autoGrantDeny = [ "org.keepassxc.KeePassXC" ];
                 };
                 users.users.alice.isNormalUser = true;
                 nixpkgs.config.allowUnfree = true;
