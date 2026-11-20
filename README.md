@@ -85,7 +85,7 @@ Prompting is unchanged when auto-grant is off, which is the default.
 | --- | --- |
 | Screenshots | `grim`, Pillow |
 | Pointer position | `hyprctl dispatch movecursor` |
-| Buttons, wheel, key combos | `ydotool` (uinput); `wlrctl` + `wtype` without it |
+| Buttons, wheel, key combos | `ydotool` (uinput); `wlrctl` + `hyprctl sendshortcut` without it |
 | Text | `wtype` (full Unicode) |
 | Windows and workspaces | `hyprctl` |
 | Approval dialog | `zenity` |
@@ -160,10 +160,12 @@ nix run github:sahastasai/Hyprland-Claude-Computer-Use   # MCP server on stdio
 claude mcp add -s user computer-use-hyprland -- "$(nix build --print-out-paths github:sahastasai/Hyprland-Claude-Computer-Use)/bin/claude-computer-use"
 ```
 
-Without a `ydotoold` your user can reach, input falls back to the Wayland
-virtual-pointer and virtual-keyboard protocols (`wlrctl`, `wtype`): clicks,
-scrolling, keys and typing work, but drags and modifier-clicks need
-`ydotoold`. `CLAUDE_CU_INPUT=ydotool|wayland` forces a backend. Set
+Without a `ydotoold` your user can reach, input falls back to paths that
+need no uinput: clicks and scrolling go through the Wayland virtual pointer
+(`wlrctl`), and keys and ASCII text go through `hyprctl dispatch sendshortcut`
+aimed at the checked window. Firefox ignores `wtype`'s virtual keyboard, so
+`wtype` is only used for non-ASCII text and Super combos. Drags and
+modifier-clicks still need `ydotoold`. `CLAUDE_CU_INPUT=ydotool|wayland` forces a backend. Set
 `CLAUDE_COMPUTER_USE_TIERS=strict` in the server's environment for the macOS
 tiers.
 

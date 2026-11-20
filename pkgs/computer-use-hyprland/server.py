@@ -7,7 +7,9 @@ open_application, switch_display, computer_batch, ...) on top of Hyprland:
   screenshots   grim (per monitor), Pillow for scaling/redaction
   pointer       hyprctl movecursor (absolute, layout coordinates) + ydotool buttons/wheel
                 (wlrctl virtual pointer when ydotoold isn't reachable)
-  keyboard      ydotool keycodes for combos (wtype when ydotoold isn't reachable), wtype for text
+  keyboard      ydotool keycodes for combos, wtype for text; without ydotoold,
+                hyprctl sendshortcut aimed at the checked window (wtype for
+                non-ASCII text and Super combos)
   windows       hyprctl clients/monitors/activewindow, focuswindow across workspaces
   approval      zenity checklist dialog
   clipboard     wl-clipboard
@@ -537,6 +539,41 @@ def wtype_args(codes, hold_ms=None):
     return args
 
 
+HYPR_MODS = {29: "CTRL", 97: "CTRL", 42: "SHIFT", 54: "SHIFT", 56: "ALT", 100: "MOD5", 125: "SUPER", 126: "SUPER"}
+
+
+def shortcut_cmd(codes, address):
+    """`sendshortcut` dispatch for one combo, or None if it isn't one key plus modifiers."""
+    mods = " ".join(dict.fromkeys(HYPR_MODS[c] for c in codes if c in HYPR_MODS))
+    keys = [KEYSYMS.get(c) for c in codes if c not in HYPR_MODS]
+    if len(keys) != 1 or keys[0] is None:
+        return None
+    return f"sendshortcut {mods}, {keys[0]}, address:{address}"
+
+
+def char_combo(ch):
+    """Key codes that type `ch` on a US layout, or None."""
+    if ch == "\n":
+        return [KEYCODES["return"]]
+    if ch == "\t":
+        return [KEYCODES["tab"]]
+    if ch.isascii() and ch.isalpha():
+        return [42, KEYCODES[ch.lower()]] if ch.isupper() else [KEYCODES[ch]]
+    if ch in SHIFTED:
+        return [42, KEYCODES[SHIFTED[ch]]]
+    if ch in KEYCODES:
+        return [KEYCODES[ch]]
+    return None
+
+
+def hypr_batch(cmds):
+    for i in range(0, len(cmds), 64):
+        out = run(["hyprctl", "--batch", " ; ".join("dispatch " + c for c in cmds[i:i + 64])]).stdout
+        bad = [line.strip() for line in out.splitlines() if line.strip() not in ("", "ok")]
+        if bad:
+            raise ToolError(f"hyprctl sendshortcut: {bad[0]}")
+
+
 def input_backend():
     """"ydotool" (uinput via ydotoold) or "wayland" (virtual keyboard/pointer
     protocols via wtype/wlrctl; no uinput or group membership needed)."""
@@ -585,6 +622,7 @@ class ComputerUse:
         self.mouse_down = False
         self.notified = False
         self.last_app = None  # for the audit log
+        self.kbd_window = None
         # Auto-grant: no approval dialog, every app controllable (Claude's own
         # windows stay read-only). Optional allow list limits which apps are
         # auto-granted (others still get the dialog); the deny list is never
@@ -816,9 +854,15 @@ class ComputerUse:
         else:
             self.ydotool("mousemove", "--wheel", "-x", str(dx), "-y", str(dy))
 
-    def press_codes(self, codes):
+    def press_codes(self, codes, window=None):
         if input_backend() == "wayland":
-            run(wtype_args(codes))
+            # Firefox drops wtype's virtual-keyboard keys, so aim keys at the
+            # checked window through Hyprland itself when possible.
+            cmd = shortcut_cmd(codes, window["address"]) if window else None
+            if cmd:
+                hypr_batch([cmd])
+            else:
+                run(wtype_args(codes))
             return
         self.ydotool("key", *[f"{c}:1" for c in codes], *[f"{c}:0" for c in reversed(codes)])
 
@@ -1098,13 +1142,39 @@ class ComputerUse:
 
     def keyboard_target(self, action):
         self.require_any_grant()
-        return self.check_target(action, self.active_window())
+        self.kbd_window = self.active_window()
+        return self.check_target(action, self.kbd_window)
+
+    def type_wayland(self, text, address):
+        """ASCII via sendshortcut to the checked window, other runs via wtype."""
+        cmds, other = [], ""
+        for ch in text:
+            combo = char_combo(ch)
+            cmd = shortcut_cmd(combo, address) if combo else None
+            if cmd is None:
+                if cmds:
+                    hypr_batch(cmds)
+                    cmds = []
+                other += ch
+                continue
+            if other:
+                run(["wtype", "-d", "4", "--", other], timeout=max(30, len(other) // 20))
+                other = ""
+            cmds.append(cmd)
+        if cmds:
+            hypr_batch(cmds)
+        if other:
+            run(["wtype", "-d", "4", "--", other], timeout=max(30, len(other) // 20))
 
     def t_type(self, args):
         text = args.get("text")
         if not isinstance(text, str) or text == "":
             raise ToolError("type requires non-empty text.")
         g = self.keyboard_target("type")
+        if input_backend() == "wayland":
+            self.type_wayland(text, self.kbd_window["address"])
+            self.notify()
+            return [text_content(f"Typed {len(text)} characters into {g['name']}")]
         try:
             run(["wtype", "-d", "4", "--", text], timeout=max(30, len(text) // 20))
         except (ToolError, FileNotFoundError):
@@ -1119,13 +1189,16 @@ class ComputerUse:
         repeat = max(1, min(int(args.get("repeat") or 1), 100))
         for codes in combos:
             self.check_system_combo(codes)
+        window = None
         if not all(SUPER_CODES & set(c) for c in combos):
             self.keyboard_target("key")
+            window = self.kbd_window
         else:
             self.require_any_grant()
         for _ in range(repeat):
             for codes in combos:
-                self.press_codes(codes)
+                # Super combos drive Hyprland itself: send them as real key events.
+                self.press_codes(codes, None if SUPER_CODES & set(codes) else window)
                 time.sleep(0.02)
         self.notify()
         return [text_content(f"Pressed {args.get('text')}" + (f" x{repeat}" if repeat > 1 else ""))]

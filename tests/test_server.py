@@ -252,12 +252,32 @@ class WaylandInput(Base):
         self.cu.call("scroll", {"coordinate": [100, 100], "scroll_direction": "down", "scroll_amount": 1})
         self.cu.call("hold_key", {"text": "ctrl+a", "duration": 0.5})
         self.assertEqual(self.tools_run("ydotool"), [])
+        self.assertEqual([c for c in self.tools_run("hyprctl") if c[1] == "--batch"], [
+            ["hyprctl", "--batch", "dispatch sendshortcut CTRL SHIFT, t, address:0xfirefox"],
+            ["hyprctl", "--batch", "dispatch sendshortcut , Return, address:0xfirefox"],
+        ])
         self.assertEqual(self.tools_run("wtype"), [
-            ["wtype", "-M", "ctrl", "-M", "shift", "-k", "t", "-m", "shift", "-m", "ctrl"],
-            ["wtype", "-k", "Return"],
             ["wtype", "-M", "ctrl", "-P", "a", "-s", "500", "-p", "a", "-m", "ctrl"],
         ])
         self.assertEqual(self.tools_run("wlrctl")[-1], ["wlrctl", "pointer", "scroll", "15", "0"])
+
+    def test_type_goes_to_checked_window(self):
+        self.cu.call("type", {"text": "Hi, ok!\u00e9"})
+        batch = [c for c in self.tools_run("hyprctl") if c[1] == "--batch"][0][2].split(" ; ")
+        self.assertEqual(batch, [
+            "dispatch sendshortcut SHIFT, h, address:0xfirefox",
+            "dispatch sendshortcut , i, address:0xfirefox",
+            "dispatch sendshortcut , comma, address:0xfirefox",
+            "dispatch sendshortcut , space, address:0xfirefox",
+            "dispatch sendshortcut , o, address:0xfirefox",
+            "dispatch sendshortcut , k, address:0xfirefox",
+            "dispatch sendshortcut SHIFT, 1, address:0xfirefox",
+        ])
+        self.assertEqual(self.tools_run("wtype"), [["wtype", "-d", "4", "--", "\u00e9"]])
+
+    def test_super_combo_uses_real_key_events(self):
+        self.cu.call("key", {"text": "super+1"})
+        self.assertEqual(self.tools_run("wtype"), [["wtype", "-M", "logo", "-k", "1", "-m", "logo"]])
 
     def test_unsupported_actions_explain(self):
         with self.assertRaisesRegex(srv.ToolError, "needs ydotoold"):
